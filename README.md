@@ -1,9 +1,16 @@
 # EXOSYS OS — Tactical Real-Time Operating System & Spatial Ecosystem
 
-![Platform](https://img.shields.io/badge/Hardware-ESP32--S3%20Dual--Core%20240MHz-00E5FF?style=for-the-badge&logo=espressif)
-![Memory](https://img.shields.io/badge/Memory-8MB%20Octal%20PSRAM%20%7C%20512KB%20SRAM-00FF41?style=for-the-badge)
+![Target Hardware](https://img.shields.io/badge/Target%20Device-LilyGo%20T--Watch%20Ultra%20(ESP32--S3)-FF005C?style=for-the-badge&logo=espressif)
+![Platform](https://img.shields.io/badge/SoC-ESP32--S3%20Dual--Core%20240MHz-00E5FF?style=for-the-badge)
+![Memory](https://img.shields.io/badge/Memory-8MB%20Octal%20PSRAM%20%7C%2016MB%20Flash-00FF41?style=for-the-badge)
 ![Kernel](https://img.shields.io/badge/Kernel-FreeRTOS%20SMP-FFB300?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-GNU%20AGPLv3%20%2F%20Commercial-FF003C?style=for-the-badge)
+
+> [!IMPORTANT]
+> **HARDWARE TARGET NOTICE (READ BEFORE FLASHING):**  
+> This specific master repository (**Exosys-OS**) is a full-stack firmware **strictly tailored and pin-mapped for the LilyGo T-Watch Ultra (ESP32-S3)**. It interacts directly at the register level with its specific hardware peripherals (410x502 AMOLED CO5300 display, U-Blox MIA-M10Q GNSS, AXP2101 PMU, DRV2605 Haptic Driver, and 8 MB Octal PSRAM).  
+> * **Do NOT flash this complete OS directly onto generic ESP32 boards or Cheap Yellow Displays (CYD) without modifying the HAL.**  
+> * If you want to use our **`.EXND` Video Engine**, **CartoEngine**, or **Remote Touch Link** on *any* generic ESP32, STM32, or CYD board, check out our standalone, hardware-agnostic satellite repositories in [@TheExoned](https://github.com/TheExoned).
 
 **Exosys OS** is a deterministic, bare-metal Real-Time Operating System and distributed pre-compilation ecosystem engineered to push dual-core microcontrollers (ESP32-S3) beyond their theoretical hardware limits. 
 
@@ -32,7 +39,7 @@ Exosys OS eliminates these bottlenecks through **Three-Tier Compute Asymmetry** 
                         TCP (:8892) / UDP (:8889) / BLE / SD
                                           |
 +-----------------------------------------v-----------------------------------------+
-|                     TIER 3: EXOSYS RTOS (ESP32-S3 @ 240 MHz)                      |
+|              TIER 3: EXOSYS RTOS (LILYGO T-WATCH ULTRA / ESP32-S3)                |
 |                                                                                   |
 |  +----------------------------------+       +----------------------------------+  |
 |  |       CORE 0 (PRO_CPU)           |       |       CORE 1 (APP_CPU)           |  |
@@ -121,7 +128,50 @@ Playing video from a MicroSD card while a map engine runs on the same SPI bus ca
 
 ---
 
-## 6. Repository Structure
+## 6. Hardware Requirements & Beginner Step-by-Step Setup Guide
+
+If you are new to embedded systems or PlatformIO, follow this exact checklist to get **Exosys OS** running on your watch without errors.
+
+### 6.1. Required Hardware
+To run this specific repository out-of-the-box, you need:
+1. **LilyGo T-Watch Ultra (ESP32-S3):** Equipped with 16 MB Flash, 8 MB Octal PSRAM, 410x502 AMOLED Touch Display, U-Blox MIA-M10Q GPS, AXP2101 PMU, and SX1262 LoRa.
+2. **MicroSD Card (8 GB to 32 GB recommended):** Formatted strictly as **FAT32**.
+3. **USB-C Data Cable:** Make sure it is a data-capable cable, not a charge-only cable.
+
+*(Note: Why won't this work on a standard $5 ESP32? Because `init_carto_engine()` allocates over **3.2 MB of contiguous PSRAM** on boot for map and video arenas. A standard ESP32 without 8 MB PSRAM will immediately crash with a `Guru Meditation Error`).*
+
+### 6.2. Step 1: Prepare the MicroSD Card
+Before turning on the watch, insert your FAT32 MicroSD card into your PC and create the following folders at the root of the card:
+```text
+SD_CARD_ROOT/
+├── MAP/                    # Place your compiled Z# folders (C_x_y.QOI clusters) here
+├── SECTORS/                # Place your compiled S_x_y.HWY road graph files here
+├── WALLPAPERS/
+│   └── ANIMATED/           # Place your AW1.exnd, AW2.exnd... video files here
+└── UI/                     # Optional: custom placeholder.qoi (256x256)
+```
+
+### 6.3. Step 2: Install VS Code & PlatformIO (Beginner Friendly)
+You do **not** need to manually download the 20+ C++ libraries (`lvgl`, `RadioLib`, `SdFat`, `XPowersLib`, etc.). **PlatformIO downloads and configures all of them automatically** using the `platformio.ini` file included in this repository.
+
+1. Download and install **[Visual Studio Code](https://code.visualstudio.com/)**.
+2. Open VS Code, click on the **Extensions** icon on the left sidebar (`Ctrl+Shift+X`), search for **PlatformIO IDE**, and click **Install**.
+3. Wait a few minutes until the PlatformIO alien icon appears on the left sidebar, then restart VS Code.
+
+### 6.4. Step 3: Clone & Flash the Firmware
+1. Clone this repository to your computer (or click the green **Code -> Download ZIP** button on GitHub and extract it):
+   ```bash
+   git clone https://github.com/TheExoned/Exosys-OS.git
+   ```
+2. In VS Code, click **File -> Open Folder...** and select the `Exosys-OS` folder.
+3. PlatformIO will automatically read `platformio.ini` and download the ESP32-S3 toolchain and all required libraries into an invisible `.pio` folder (this takes 2–5 minutes on the first run).
+4. Connect your **LilyGo T-Watch Ultra** to your PC via USB-C.
+   * *Troubleshooting Tip:* If Windows does not detect the watch port or upload fails, put the watch into **Download Mode**: press and hold the **Crown/Boot button**, press the **Reset** button (or power cycle), and release the Crown button.
+5. Click the **PlatformIO Upload arrow (`->`)** on the bottom blue status bar of VS Code (or run `pio run -t upload` in the terminal).
+
+---
+
+## 7. Repository Structure
 
 ```text
 Exosys-OS/
@@ -143,7 +193,7 @@ Exosys-OS/
 
 ---
 
-## 7. Licensing (Dual-License Model)
+## 8. Licensing (Dual-License Model)
 
 **Copyright (C) 2026 Axel Daniel Luna Carmona (TheExoned). All Rights Reserved.**
 
