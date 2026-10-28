@@ -1,3 +1,13 @@
-.pio
-.vscode
-build
+# Excluir la basura de PlatformIO y VS Code
+.pio/
+.vscode/
+build/
+*.o
+*.elf
+*.bin
+
+# Excluir archivos de configuración local
+.DS_Store
+*.log
+*.bak
+*.tmp
