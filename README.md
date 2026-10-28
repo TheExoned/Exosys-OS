@@ -8,7 +8,7 @@
 
 > [!IMPORTANT]
 > **HARDWARE TARGET NOTICE (READ BEFORE FLASHING):**  
-> This specific master repository (**Exosys-OS**) is a full-stack firmware **strictly tailored and pin-mapped for the LilyGo T-Watch Ultra (ESP32-S3)**. It interacts directly at the register level with its specific hardware peripherals (410x502 AMOLED CO5300 display, U-Blox MIA-M10Q GNSS, AXP2101 PMU, DRV2605 Haptic Driver, and 8 MB Octal PSRAM).  
+> This specific master repository (**Exosys-OS**) is a full-stack firmware **strictly tailored and pin-mapped for the LilyGo T-Watch Ultra (ESP32-S3)**. It interacts directly at the register level with its specific hardware peripherals (410x502 AMOLED CO5300 display, U-Blox MIA-M10Q GNSS, AXP2101 PMU, DRV2605 Haptic Driver, and 8 MB Quad PSRAM).  
 > * **Do NOT flash this complete OS directly onto generic ESP32 boards or Cheap Yellow Displays (CYD) without modifying the HAL.**  
 > * If you want to use our **`.EXND` Video Engine**, **CartoEngine**, or **Remote Touch Link** on *any* generic ESP32, STM32, or CYD board, check out our standalone, hardware-agnostic satellite repositories in [@TheExoned](https://github.com/TheExoned).
 
