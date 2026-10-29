@@ -2666,7 +2666,11 @@ void raw_reader_task(void *pvParameters) {
 // ---------------------------------------------------------------------
 // 15. NÚCLEO MATEMÁTICO A* CON PROYECCIÓN PERPENDICULAR A ARISTAS Y CULLING
 // ---------------------------------------------------------------------
-struct RouteEdge { uint32_t target; float weight; uint32_t next; };
+struct RouteEdge {
+    uint32_t next;
+    uint16_t target;
+    uint16_t weight_q; // Peso en unidades de 0.25 m (hasta 16,383.75 m por tramo)
+};
 struct AStarNode { uint32_t id; float f_score; };
 
 float fast_distance(float lat1, float lon1, float lat2, float lon2) {
@@ -2759,6 +2763,7 @@ static lv_obj_t * bar_route_prog = NULL;
 
 static void actualizar_progreso_ruta_ui(uint8_t pct, const char* etapa_txt) {
     if (scr_mapa == NULL) return;
+    if (pct > 100) pct = 100;
     if (xSemaphoreTakeRecursive(lvgl_mutex, pdMS_TO_TICKS(60))) {
         uint32_t col = get_active_tactical_color();
         if (panel_route_prog == NULL) {
@@ -2835,7 +2840,7 @@ static inline float project_point_onto_segment_m2(
 }
 
 // ---------------------------------------------------------------------
-// MOTOR A* MULTI-SECTOR CON EVASIÓN BIDIRECCIONAL DE ISLAS Y PROGRESO
+// MOTOR A* MULTI-SECTOR DE PASADA ÚNICA, SOLDADO FRONTERIZO Y MULTI-ANCLA
 // ---------------------------------------------------------------------
 static bool run_astar_multi_hwy_files(
     const char (*file_list)[64],
@@ -2846,32 +2851,37 @@ static bool run_astar_multi_hwy_files(
     float end_lng,
     float max_anchor_dist_m,
     bool filter_corridor_capsule,
+    float custom_capsule_radius_m,
     uint8_t prog_base,
     uint8_t prog_span
 ) {
     if (file_count <= 0) return false;
 
-    const uint32_t MAX_NODES_CAP = 38000;
-    const uint32_t MAX_EDGES_CAP = 75000;
-    const uint32_t HASH_BUCKETS  = 32768;
-    const uint32_t closed_bytes  = (MAX_NODES_CAP + 7U) >> 3;
-    const uint32_t aligned_closed = (closed_bytes + 3U) & ~3U;
+    const uint32_t MAX_NODES_CAP      = 44000;
+    const uint32_t MAX_EDGES_CAP      = 120000;
+    const uint32_t MAX_FWD_EDGES_CAP  = 62000; // Garantiza espacio para aristas bidireccionales y costuras
+    const uint32_t HASH_BUCKETS       = 32768;
+    const uint16_t GOAL_NODE_ID       = 0xFFFE;
+    const uint16_t INVALID_NODE_16    = 0xFFFF;
+    const uint32_t MAX_FILE_NODES_MAP = VAULT_ARENA_BYTES / sizeof(uint16_t); // 409,600 nodos por archivo .HWY
+    const uint32_t closed_bytes       = (MAX_NODES_CAP + 7U) >> 3;
+    const uint32_t aligned_closed     = (closed_bytes + 3U) & ~3U;
 
     uint32_t offset = 0;
-    RouteNode* macro_nodes         = (RouteNode*)(global_arena + offset); offset += MAX_NODES_CAP * sizeof(RouteNode);
-    uint32_t* macro_first_edge     = (uint32_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint32_t);
-    RouteEdge* macro_edges         = (RouteEdge*)(global_arena + offset); offset += MAX_EDGES_CAP * sizeof(RouteEdge);
-    float* g_score                 = (float*)(global_arena + offset);     offset += MAX_NODES_CAP * sizeof(float);
-    uint32_t* came_from            = (uint32_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint32_t);
-    uint8_t* closed_bits           = (uint8_t*)(global_arena + offset);   offset += aligned_closed;
-    uint8_t* goal_bits             = (uint8_t*)(global_arena + offset);   offset += aligned_closed;
-    uint8_t* excluded_start_bits   = (uint8_t*)(global_arena + offset);   offset += aligned_closed;
-    uint8_t* excluded_end_bits     = (uint8_t*)(global_arena + offset);   offset += aligned_closed;
-    uint8_t* io_buf                = (uint8_t*)(global_arena + offset);   offset += 8192;
-    uint16_t* hash_heads           = (uint16_t*)(global_arena + offset);  offset += HASH_BUCKETS * sizeof(uint16_t);
-    uint16_t* hash_next            = (uint16_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint16_t);
+    RouteNode* macro_nodes       = (RouteNode*)(global_arena + offset); offset += MAX_NODES_CAP * sizeof(RouteNode);
+    uint32_t* macro_first_edge   = (uint32_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint32_t);
+    RouteEdge* macro_edges       = (RouteEdge*)(global_arena + offset); offset += MAX_EDGES_CAP * sizeof(RouteEdge);
+    float* g_score               = (float*)(global_arena + offset);     offset += MAX_NODES_CAP * sizeof(float);
+    uint16_t* came_from          = (uint16_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint16_t);
+    uint16_t* goal_pen_q         = (uint16_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint16_t);
+    uint8_t* closed_bits         = (uint8_t*)(global_arena + offset);   offset += aligned_closed;
+    uint8_t* node_file_id        = (uint8_t*)(global_arena + offset);   offset += MAX_NODES_CAP;
+    uint8_t* io_buf              = (uint8_t*)(global_arena + offset);   offset += 8192;
+    uint16_t* hash_heads         = (uint16_t*)(global_arena + offset);  offset += HASH_BUCKETS * sizeof(uint16_t);
+    uint16_t* hash_next          = (uint16_t*)(global_arena + offset);  offset += MAX_NODES_CAP * sizeof(uint16_t);
 
-    uint32_t* local_to_global = came_from;
+    // Durante la lectura de archivos, vault_arena (819 KB) está libre y aloja hasta 409,600 índices locales
+    uint16_t* local_to_global = (uint16_t*)vault_arena;
 
     memset(macro_first_edge, 0xFF, MAX_NODES_CAP * sizeof(uint32_t));
     memset(hash_heads, 0xFF, HASH_BUCKETS * sizeof(uint16_t));
@@ -2882,18 +2892,24 @@ static bool run_astar_multi_hwy_files(
     const float lat_scale_m = 111319.9f;
     const float direct_dist_m = fast_distance(start_lat, start_lng, end_lat, end_lng);
 
-    const float capsule_radius_m = max(2600.0f, direct_dist_m * 0.55f);
+    const float capsule_radius_m = (custom_capsule_radius_m > 100.0f)
+        ? custom_capsule_radius_m
+        : constrain(direct_dist_m * 0.42f + 320.0f, 420.0f, 2200.0f);
     const float capsule_r2 = capsule_radius_m * capsule_radius_m;
 
-    const float pad_deg = max(0.035f, (capsule_radius_m / 111319.9f) * 1.25f);
-    const float box_s = min(start_lat, end_lat) - pad_deg;
-    const float box_n = max(start_lat, end_lat) + pad_deg;
-    const float box_w = min(start_lng, end_lng) - pad_deg;
-    const float box_e = max(start_lng, end_lng) + pad_deg;
+    const float pad_lat_deg = (capsule_radius_m / lat_scale_m) * 1.15f;
+    const float pad_lon_deg = (capsule_radius_m / max(10000.0f, lon_scale_m)) * 1.15f;
+    const float box_s = min(start_lat, end_lat) - pad_lat_deg;
+    const float box_n = max(start_lat, end_lat) + pad_lat_deg;
+    const float box_w = min(start_lng, end_lng) - pad_lon_deg;
+    const float box_e = max(start_lng, end_lng) + pad_lon_deg;
 
     uint32_t total_nodes = 0;
     uint32_t edges_stored = 0;
     int files_loaded = 0;
+
+    uint8_t io_span = (uint8_t)((prog_span * 40U) / 100U);
+    if (io_span < 4) io_span = 4;
 
     for (int f_idx = 0; f_idx < file_count; f_idx++) {
         const char* fname = file_list[f_idx];
@@ -2910,13 +2926,14 @@ static bool run_astar_multi_hwy_files(
         uint32_t file_nodes = headers[0];
         uint32_t file_edges = headers[1];
 
-        if (file_nodes == 0 || file_edges == 0 || file_nodes > MAX_NODES_CAP) {
+        if (file_nodes == 0 || file_edges == 0 || file_nodes > MAX_FILE_NODES_MAP) {
             f.close();
             continue;
         }
 
-        uint8_t load_pct = prog_base + (uint8_t)(((f_idx + 1) * (prog_span / 2)) / max(1, file_count));
-        actualizar_progreso_ruta_ui(load_pct, (file_count > 1) ? "UNIENDO SECTORES" : "CARGANDO RED VIAL");
+        uint8_t f_base_pct = prog_base + (uint8_t)((f_idx * io_span) / max(1, file_count));
+        uint8_t f_next_pct = prog_base + (uint8_t)(((f_idx + 1) * io_span) / max(1, file_count));
+        actualizar_progreso_ruta_ui(f_base_pct, (file_count > 1) ? "CARGANDO SECTORES" : "CARGANDO RED VIAL");
 
         bool apply_filter = filter_corridor_capsule || (file_nodes > (MAX_NODES_CAP - total_nodes - 500));
 
@@ -2934,7 +2951,7 @@ static bool run_astar_multi_hwy_files(
 
                 if (apply_filter) {
                     if (nlat < box_s || nlat > box_n || nlon < box_w || nlon > box_e) {
-                        local_to_global[n_read++] = 0xFFFFFFFF;
+                        local_to_global[n_read++] = INVALID_NODE_16;
                         continue;
                     }
                     float t_cap, plat_cap, plon_cap;
@@ -2943,44 +2960,45 @@ static bool run_astar_multi_hwy_files(
                         lat_scale_m, lon_scale_m, t_cap, plat_cap, plon_cap
                     );
                     if (d2_cap > capsule_r2) {
-                        local_to_global[n_read++] = 0xFFFFFFFF;
+                        local_to_global[n_read++] = INVALID_NODE_16;
                         continue;
                     }
                 }
 
-                int32_t base_qlat = (int32_t)roundf(nlat * 25000.0f);
-                int32_t base_qlon = (int32_t)roundf(nlon * 25000.0f);
-                uint32_t matched_g = 0xFFFFFFFF;
+                int32_t base_qlat = (int32_t)roundf(nlat * 20000.0f);
+                int32_t base_qlon = (int32_t)roundf(nlon * 20000.0f);
+                uint16_t matched_g = INVALID_NODE_16;
 
                 if (file_count > 1) {
-                    for (int32_t dlat = -1; dlat <= 1 && matched_g == 0xFFFFFFFF; dlat++) {
+                    for (int32_t dlat = -1; dlat <= 1 && matched_g == INVALID_NODE_16; dlat++) {
                         for (int32_t dlon = -1; dlon <= 1; dlon++) {
                             uint32_t h_chk = ((uint32_t)(base_qlat + dlat) * 73856093U ^
                                               (uint32_t)(base_qlon + dlon) * 19349663U) & (HASH_BUCKETS - 1U);
                             uint16_t cur = hash_heads[h_chk];
-                            while (cur != 0xFFFF) {
-                                if (fabsf(macro_nodes[cur].lat - nlat) <= 0.000025f &&
-                                    fabsf(macro_nodes[cur].lon - nlon) <= 0.000025f) {
-                                    matched_g = (uint32_t)cur;
+                            while (cur != INVALID_NODE_16) {
+                                if (fabsf(macro_nodes[cur].lat - nlat) <= 0.000045f &&
+                                    fabsf(macro_nodes[cur].lon - nlon) <= 0.000045f) {
+                                    matched_g = cur;
                                     break;
                                 }
                                 cur = hash_next[cur];
                             }
-                            if (matched_g != 0xFFFFFFFF) break;
+                            if (matched_g != INVALID_NODE_16) break;
                         }
                     }
                 }
 
-                if (matched_g == 0xFFFFFFFF) {
+                if (matched_g == INVALID_NODE_16) {
                     if (total_nodes < MAX_NODES_CAP) {
-                        matched_g = total_nodes++;
+                        matched_g = (uint16_t)(total_nodes++);
                         macro_nodes[matched_g].lat = nlat;
                         macro_nodes[matched_g].lon = nlon;
+                        node_file_id[matched_g] = (uint8_t)f_idx;
                         if (file_count > 1) {
                             uint32_t h_ins = ((uint32_t)base_qlat * 73856093U ^
                                               (uint32_t)base_qlon * 19349663U) & (HASH_BUCKETS - 1U);
                             hash_next[matched_g] = hash_heads[h_ins];
-                            hash_heads[h_ins] = (uint16_t)matched_g;
+                            hash_heads[h_ins] = matched_g;
                         }
                     }
                 }
@@ -2993,6 +3011,9 @@ static bool run_astar_multi_hwy_files(
             f.close();
             continue;
         }
+
+        uint8_t mid_f_pct = (f_base_pct + f_next_pct) >> 1;
+        actualizar_progreso_ruta_ui(mid_f_pct, "CARGANDO ARISTAS");
 
         uint32_t e_read = 0;
         while (e_read < file_edges) {
@@ -3010,21 +3031,22 @@ static bool run_astar_multi_hwy_files(
                 e_read++;
 
                 if (lu >= file_nodes || lv >= file_nodes) continue;
-                uint32_t gu = local_to_global[lu];
-                uint32_t gv = local_to_global[lv];
-                if (gu == 0xFFFFFFFF || gv == 0xFFFFFFFF || gu == gv) continue;
-                if (dist < 0.5f) dist = 0.5f;
+                uint16_t gu = local_to_global[lu];
+                uint16_t gv = local_to_global[lv];
+                if (gu == INVALID_NODE_16 || gv == INVALID_NODE_16 || gu == gv) continue;
+
+                uint16_t w_q = (uint16_t)constrain((int32_t)(dist * 4.0f + 0.5f), 2, 65535);
 
                 bool exists_uv = false;
                 for (uint32_t e = macro_first_edge[gu]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
                     if (macro_edges[e].target == gv) {
-                        if (dist < macro_edges[e].weight) macro_edges[e].weight = dist;
+                        if (w_q < macro_edges[e].weight_q) macro_edges[e].weight_q = w_q;
                         exists_uv = true;
                         break;
                     }
                 }
-                if (!exists_uv && edges_stored < MAX_EDGES_CAP) {
-                    macro_edges[edges_stored] = {gv, dist, macro_first_edge[gu]};
+                if (!exists_uv && edges_stored < MAX_FWD_EDGES_CAP) {
+                    macro_edges[edges_stored] = {macro_first_edge[gu], gv, w_q};
                     macro_first_edge[gu] = edges_stored++;
                 }
             }
@@ -3034,255 +3056,339 @@ static bool run_astar_multi_hwy_files(
         f.close();
         files_loaded++;
 
-        if (total_nodes >= (MAX_NODES_CAP - 800) || edges_stored >= (MAX_EDGES_CAP - 1500)) {
+        if (total_nodes >= (MAX_NODES_CAP - 400) || edges_stored >= (MAX_FWD_EDGES_CAP - 500)) {
             break;
         }
     }
 
-    uint32_t forward_edges_count = edges_stored;
-    if (files_loaded == 0 || total_nodes < 2 || forward_edges_count == 0) {
+    if (files_loaded == 0 || total_nodes < 2 || edges_stored == 0) {
         last_astar_fail_reason = max(last_astar_fail_reason, (uint8_t)1);
         return false;
     }
 
+    // -----------------------------------------------------------------
+    // SOLDADOR AUTOMÁTICO DE FRONTERAS ENTRE SECTORES (TOLERANCIA 42 m)
+    // -----------------------------------------------------------------
+    if (files_loaded > 1 && edges_stored < MAX_FWD_EDGES_CAP) {
+        actualizar_progreso_ruta_ui(prog_base + io_span + 3, "SOLDANDO FRONTERAS");
+        memset(hash_heads, 0xFF, HASH_BUCKETS * sizeof(uint16_t));
+        memset(hash_next, 0xFF, total_nodes * sizeof(uint16_t));
+
+        for (uint32_t u = 0; u < total_nodes; u++) {
+            int32_t glat = (int32_t)roundf(macro_nodes[u].lat * 2200.0f); // Celdas de ~50m
+            int32_t glon = (int32_t)roundf(macro_nodes[u].lon * 2200.0f);
+            uint32_t h = ((uint32_t)glat * 73856093U ^ (uint32_t)glon * 19349663U) & (HASH_BUCKETS - 1U);
+            hash_next[u] = hash_heads[h];
+            hash_heads[h] = (uint16_t)u;
+        }
+
+        const float stitch_max_d2 = 42.0f * 42.0f;
+        for (uint32_t u = 0; u < total_nodes && edges_stored + 2 < MAX_FWD_EDGES_CAP; u++) {
+            float ulat = macro_nodes[u].lat;
+            float ulon = macro_nodes[u].lon;
+            uint8_t uf = node_file_id[u];
+            int32_t glat = (int32_t)roundf(ulat * 2200.0f);
+            int32_t glon = (int32_t)roundf(ulon * 2200.0f);
+
+            uint16_t best_v = INVALID_NODE_16;
+            float best_d2 = stitch_max_d2;
+
+            for (int32_t dlat = -1; dlat <= 1; dlat++) {
+                for (int32_t dlon = -1; dlon <= 1; dlon++) {
+                    uint32_t h = ((uint32_t)(glat + dlat) * 73856093U ^
+                                  (uint32_t)(glon + dlon) * 19349663U) & (HASH_BUCKETS - 1U);
+                    uint16_t v = hash_heads[h];
+                    while (v != INVALID_NODE_16) {
+                        if (v > u && node_file_id[v] != uf) {
+                            float dx = (macro_nodes[v].lon - ulon) * lon_scale_m;
+                            float dy = (macro_nodes[v].lat - ulat) * lat_scale_m;
+                            float d2 = dx * dx + dy * dy;
+                            if (d2 < best_d2) {
+                                best_d2 = d2;
+                                best_v = v;
+                            }
+                        }
+                        v = hash_next[v];
+                    }
+                }
+            }
+
+            if (best_v != INVALID_NODE_16) {
+                uint16_t w_q = (uint16_t)constrain((int32_t)(sqrtf(best_d2) * 4.4f + 4.0f), 4, 65535);
+                macro_edges[edges_stored] = {macro_first_edge[u], best_v, w_q};
+                macro_first_edge[u] = edges_stored++;
+                macro_edges[edges_stored] = {macro_first_edge[best_v], (uint16_t)u, w_q};
+                macro_first_edge[best_v] = edges_stored++;
+            }
+            if ((u & 4095U) == 0) yield();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // GENERACIÓN GARANTIZADA DE ARISTAS INVERSAS (CONECTIVIDAD FUERTE)
+    // -----------------------------------------------------------------
+    actualizar_progreso_ruta_ui(prog_base + io_span + 6, "PREPARANDO GRAFO");
+    uint32_t forward_edges_count = edges_stored;
     for (uint32_t u = 0; u < total_nodes && edges_stored < MAX_EDGES_CAP; u++) {
         for (uint32_t e = macro_first_edge[u]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
             if (e >= forward_edges_count) continue;
-            uint32_t v = macro_edges[e].target;
-            float dist = macro_edges[e].weight;
+            uint16_t v = macro_edges[e].target;
+            uint16_t w_q = macro_edges[e].weight_q;
 
             bool has_reverse = false;
             for (uint32_t rev = macro_first_edge[v]; rev != 0xFFFFFFFF; rev = macro_edges[rev].next) {
-                if (macro_edges[rev].target == u) {
+                if (macro_edges[rev].target == (uint16_t)u) {
                     has_reverse = true;
                     break;
                 }
             }
             if (!has_reverse && edges_stored < MAX_EDGES_CAP) {
-                macro_edges[edges_stored] = {u, dist * 1.35f + 4.0f, macro_first_edge[v]};
+                uint32_t rev_w = ((uint32_t)w_q * 135U) / 100U + 16U;
+                if (rev_w > 65535U) rev_w = 65535U;
+                macro_edges[edges_stored] = {macro_first_edge[v], (uint16_t)u, (uint16_t)rev_w};
                 macro_first_edge[v] = edges_stored++;
             }
         }
         if ((u & 4095U) == 0) yield();
     }
 
+    // -----------------------------------------------------------------
+    // ANCLAJE RÁPIDO CON FILTRO DE CAJA + INYECCIÓN MULTI-ANCLA (220 m)
+    // -----------------------------------------------------------------
+    actualizar_progreso_ruta_ui(prog_base + io_span + 10, "ANCLANDO EXTREMOS");
+
     const float max_anchor_d2 = max_anchor_dist_m * max_anchor_dist_m;
-    const uint32_t active_closed_bytes = (total_nodes + 7U) >> 3;
+    float min_start_seg_d2 = 1e30f;
+    float min_end_seg_d2   = 1e30f;
+    uint16_t best_start_u  = INVALID_NODE_16;
+    uint16_t best_end_u    = INVALID_NODE_16;
 
-    memset(excluded_start_bits, 0x00, active_closed_bytes);
-    memset(excluded_end_bits,   0x00, active_closed_bytes);
-
-    AStarNode* pq_array = (AStarNode*)vault_arena;
-    uint32_t max_pq = VAULT_ARENA_BYTES / sizeof(AStarNode);
-
-    float best_start_proj_lat = start_lat;
-    float best_start_proj_lon = start_lng;
-    float best_end_proj_lat   = end_lat;
-    float best_end_proj_lon   = end_lng;
-    uint32_t final_end_node   = 0xFFFFFFFF;
-    float end_corridor_d2     = 0.0f;
-    bool reached              = false;
-
-    for (int attempt = 0; attempt < 6; attempt++) {
-        uint8_t astar_pct = prog_base + (prog_span / 2) + (uint8_t)(((attempt + 1) * (prog_span / 2)) / 6);
-        actualizar_progreso_ruta_ui(min((uint8_t)96, astar_pct), "TRAZANDO RUTA OPTIMA");
-
-        float min_start_seg_d2 = 1e30f;
-        float min_end_seg_d2   = 1e30f;
-        uint32_t best_end_u    = 0xFFFFFFFF;
-        uint32_t best_end_v    = 0xFFFFFFFF;
-        uint32_t best_start_u  = 0xFFFFFFFF;
-        uint32_t best_start_v  = 0xFFFFFFFF;
+    // Pasada rápida en vecindad local (750m) y respaldo amplio si es zona rural/arterial
+    float search_radii_deg[2] = { 0.007f, (max_anchor_dist_m / 111319.9f) + 0.005f };
+    for (int r_pass = 0; r_pass < 2; r_pass++) {
+        float deg_lim = search_radii_deg[r_pass];
+        bool need_s = (best_start_u == INVALID_NODE_16);
+        bool need_e = (best_end_u == INVALID_NODE_16);
+        if (!need_s && !need_e) break;
 
         for (uint32_t u = 0; u < total_nodes; u++) {
             float ulat = macro_nodes[u].lat;
             float ulon = macro_nodes[u].lon;
-            bool u_excl_s = (excluded_start_bits[u >> 3] & (1U << (u & 7U))) != 0;
-            bool u_excl_e = (excluded_end_bits[u >> 3]   & (1U << (u & 7U))) != 0;
+            bool near_s = need_s && (fabsf(ulat - start_lat) <= deg_lim) && (fabsf(ulon - start_lng) <= deg_lim);
+            bool near_e = need_e && (fabsf(ulat - end_lat)   <= deg_lim) && (fabsf(ulon - end_lng)   <= deg_lim);
+            if (!near_s && !near_e) continue;
 
             for (uint32_t e = macro_first_edge[u]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
                 if (e >= forward_edges_count) continue;
-                uint32_t v = macro_edges[e].target;
+                uint16_t v = macro_edges[e].target;
                 float vlat = macro_nodes[v].lat;
                 float vlon = macro_nodes[v].lon;
 
-                if (!u_excl_s && !(excluded_start_bits[v >> 3] & (1U << (v & 7U)))) {
+                if (near_s) {
                     float t_s, plat_s, plon_s;
                     float d2_s = project_point_onto_segment_m2(
                         start_lat, start_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_s, plat_s, plon_s
                     );
                     if (d2_s < min_start_seg_d2) {
                         min_start_seg_d2 = d2_s;
-                        best_start_proj_lat = plat_s;
-                        best_start_proj_lon = plon_s;
-                        best_start_u = u;
-                        best_start_v = v;
+                        best_start_u = (uint16_t)u;
                     }
                 }
-
-                if (!u_excl_e && !(excluded_end_bits[v >> 3] & (1U << (v & 7U)))) {
+                if (near_e) {
                     float t_e, plat_e, plon_e;
                     float d2_e = project_point_onto_segment_m2(
                         end_lat, end_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_e, plat_e, plon_e
                     );
                     if (d2_e < min_end_seg_d2) {
                         min_end_seg_d2 = d2_e;
-                        best_end_proj_lat = plat_e;
-                        best_end_proj_lon = plon_e;
-                        best_end_u = u;
-                        best_end_v = v;
+                        best_end_u = (uint16_t)u;
                     }
                 }
             }
-            if ((u & 4095U) == 0) yield();
         }
+    }
 
-        if (best_start_u == 0xFFFFFFFF || best_end_u == 0xFFFFFFFF ||
-            min_start_seg_d2 > max_anchor_d2 || min_end_seg_d2 > max_anchor_d2) {
-            if (attempt == 0) last_astar_fail_reason = max(last_astar_fail_reason, (uint8_t)2);
+    if (best_start_u == INVALID_NODE_16 || best_end_u == INVALID_NODE_16 ||
+        min_start_seg_d2 > max_anchor_d2 || min_end_seg_d2 > max_anchor_d2) {
+        last_astar_fail_reason = max(last_astar_fail_reason, (uint8_t)2);
+        return false;
+    }
+
+    last_astar_fail_reason = max(last_astar_fail_reason, (uint8_t)3);
+
+    const float base_s_dist = sqrtf(min_start_seg_d2);
+    const float base_e_dist = sqrtf(min_end_seg_d2);
+    const float start_corridor_m  = max(240.0f, base_s_dist + 180.0f);
+    const float start_corridor_d2 = start_corridor_m * start_corridor_m;
+    const float end_corridor_m    = max(240.0f, base_e_dist + 180.0f);
+    const float end_corridor_d2   = end_corridor_m * end_corridor_m;
+
+    const float s_box_deg = (start_corridor_m / 111319.9f) * 1.4f + 0.002f;
+    const float e_box_deg = (end_corridor_m   / 111319.9f) * 1.4f + 0.002f;
+
+    const uint32_t active_closed_bytes = (total_nodes + 7U) >> 3;
+    for (uint32_t i = 0; i < total_nodes; i++) {
+        g_score[i] = 1e30f;
+        came_from[i] = INVALID_NODE_16;
+        goal_pen_q[i] = 0xFFFF;
+    }
+    memset(closed_bits, 0x00, active_closed_bytes);
+
+    AStarNode* pq_array = (AStarNode*)vault_arena;
+    uint32_t max_pq = VAULT_ARENA_BYTES / sizeof(AStarNode);
+    uint32_t pq_size = 0;
+
+    auto fast_h_goal = [&](uint32_t node_id) -> float {
+        float dx = (end_lng - macro_nodes[node_id].lon) * lon_scale_m;
+        float dy = (end_lat - macro_nodes[node_id].lat) * lat_scale_m;
+        return sqrtf(dx * dx + dy * dy);
+    };
+
+    auto push_pq = [&](uint32_t id, float f_val) {
+        if (pq_size >= max_pq) return;
+        uint32_t i = pq_size++;
+        while (i > 0) {
+            uint32_t p = (i - 1) >> 1;
+            if (pq_array[p].f_score <= f_val) break;
+            pq_array[i] = pq_array[p];
+            i = p;
+        }
+        pq_array[i] = {id, f_val};
+    };
+
+    auto pop_pq = [&]() -> AStarNode {
+        AStarNode root = pq_array[0];
+        AStarNode last = pq_array[--pq_size];
+        uint32_t i = 0;
+        while ((i << 1) + 1 < pq_size) {
+            uint32_t a = (i << 1) + 1;
+            uint32_t b = a + 1;
+            uint32_t c = (b < pq_size && pq_array[b].f_score < pq_array[a].f_score) ? b : a;
+            if (pq_array[c].f_score >= last.f_score) break;
+            pq_array[i] = pq_array[c];
+            i = c;
+        }
+        pq_array[i] = last;
+        return root;
+    };
+
+    for (uint32_t u = 0; u < total_nodes; u++) {
+        float ulat = macro_nodes[u].lat;
+        float ulon = macro_nodes[u].lon;
+        bool check_s = (fabsf(ulat - start_lat) <= s_box_deg) && (fabsf(ulon - start_lng) <= s_box_deg);
+        bool check_e = (fabsf(ulat - end_lat)   <= e_box_deg) && (fabsf(ulon - end_lng)   <= e_box_deg);
+        if (!check_s && !check_e) continue;
+
+        for (uint32_t e = macro_first_edge[u]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
+            if (e >= forward_edges_count) continue;
+            uint16_t v = macro_edges[e].target;
+            float vlat = macro_nodes[v].lat;
+            float vlon = macro_nodes[v].lon;
+            float w = (float)macro_edges[e].weight_q * 0.25f;
+
+            if (check_s) {
+                float t_s, plat_s, plon_s;
+                float d2_s = project_point_onto_segment_m2(
+                    start_lat, start_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_s, plat_s, plon_s
+                );
+                if (d2_s <= start_corridor_d2) {
+                    float perp_pen = max(0.0f, sqrtf(d2_s) - base_s_dist) * 3.0f;
+                    float cost_to_v = perp_pen + (1.0f - t_s) * w;
+                    if (cost_to_v < g_score[v]) {
+                        g_score[v] = cost_to_v;
+                        came_from[v] = INVALID_NODE_16;
+                        push_pq(v, cost_to_v + fast_h_goal(v));
+                    }
+                    float cost_to_u = perp_pen + t_s * w;
+                    if (cost_to_u < g_score[u]) {
+                        g_score[u] = cost_to_u;
+                        came_from[u] = INVALID_NODE_16;
+                        push_pq(u, cost_to_u + fast_h_goal(u));
+                    }
+                }
+            }
+
+            if (check_e) {
+                float t_e, plat_e, plon_e;
+                float d2_e = project_point_onto_segment_m2(
+                    end_lat, end_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_e, plat_e, plon_e
+                );
+                if (d2_e <= end_corridor_d2) {
+                    float perp_pen = max(0.0f, sqrtf(d2_e) - base_e_dist) * 3.0f;
+                    uint16_t pen_u = (uint16_t)constrain((int32_t)((perp_pen + t_e * w) * 4.0f), 0, 65534);
+                    uint16_t pen_v = (uint16_t)constrain((int32_t)((perp_pen + (1.0f - t_e) * w) * 4.0f), 0, 65534);
+                    if (pen_u < goal_pen_q[u]) goal_pen_q[u] = pen_u;
+                    if (pen_v < goal_pen_q[v]) goal_pen_q[v] = pen_v;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // BÚSQUEDA HEURÍSTICA A* CON PROGRESO DINÁMICO POR FRENTE DE ONDA
+    // -----------------------------------------------------------------
+    uint8_t search_base_pct = prog_base + io_span + 12;
+    uint8_t search_span_pct = (prog_base + prog_span > search_base_pct) ? (prog_base + prog_span - search_base_pct) : 10;
+    actualizar_progreso_ruta_ui(search_base_pct, "TRAZANDO RUTA OPTIMA");
+
+    uint16_t final_end_node = INVALID_NODE_16;
+    float best_goal_total   = 1e30f;
+    float min_h_seen        = max(1.0f, direct_dist_m);
+    uint32_t loop_cnt       = 0;
+    bool reached            = false;
+
+    while (pq_size > 0) {
+        AStarNode top = pop_pq();
+        uint32_t curr = top.id;
+
+        if (curr == GOAL_NODE_ID) {
+            reached = (final_end_node != INVALID_NODE_16);
             break;
         }
 
-        last_astar_fail_reason = max(last_astar_fail_reason, (uint8_t)3);
+        uint8_t mask = (uint8_t)(1U << (curr & 7U));
+        uint32_t byte_idx = curr >> 3;
+        if (closed_bits[byte_idx] & mask) continue;
+        closed_bits[byte_idx] |= mask;
 
-        const float start_corridor_m = sqrtf(min_start_seg_d2) + 60.0f;
-        const float start_corridor_d2 = start_corridor_m * start_corridor_m;
+        float curr_g = g_score[curr];
 
-        const float end_corridor_m = sqrtf(min_end_seg_d2) + 55.0f;
-        end_corridor_d2 = end_corridor_m * end_corridor_m;
-
-        for (uint32_t i = 0; i < total_nodes; i++) {
-            g_score[i] = 1e30f;
-            came_from[i] = 0xFFFFFFFF;
-        }
-        memset(closed_bits, 0x00, active_closed_bytes);
-        memset(goal_bits,   0x00, active_closed_bytes);
-
-        auto fast_h_goal = [&](uint32_t node_id) -> float {
-            float dx = (best_end_proj_lon - macro_nodes[node_id].lon) * lon_scale_m;
-            float dy = (best_end_proj_lat - macro_nodes[node_id].lat) * lat_scale_m;
-            return sqrtf(dx * dx + dy * dy);
-        };
-
-        uint32_t pq_size = 0;
-        auto push_pq = [&](uint32_t id, float f_val) {
-            if (pq_size >= max_pq) return;
-            uint32_t i = pq_size++;
-            while (i > 0) {
-                uint32_t p = (i - 1) >> 1;
-                if (pq_array[p].f_score <= f_val) break;
-                pq_array[i] = pq_array[p];
-                i = p;
+        if (goal_pen_q[curr] != 0xFFFF) {
+            float total_goal_cost = curr_g + (float)goal_pen_q[curr] * 0.25f;
+            if (total_goal_cost < best_goal_total) {
+                best_goal_total = total_goal_cost;
+                final_end_node = (uint16_t)curr;
+                push_pq(GOAL_NODE_ID, total_goal_cost);
             }
-            pq_array[i] = {id, f_val};
-        };
-
-        auto pop_pq = [&]() -> AStarNode {
-            AStarNode root = pq_array[0];
-            AStarNode last = pq_array[--pq_size];
-            uint32_t i = 0;
-            while ((i << 1) + 1 < pq_size) {
-                uint32_t a = (i << 1) + 1;
-                uint32_t b = a + 1;
-                uint32_t c = (b < pq_size && pq_array[b].f_score < pq_array[a].f_score) ? b : a;
-                if (pq_array[c].f_score >= last.f_score) break;
-                pq_array[i] = pq_array[c];
-                i = c;
-            }
-            pq_array[i] = last;
-            return root;
-        };
-
-        const float base_s_dist = sqrtf(min_start_seg_d2);
-        for (uint32_t u = 0; u < total_nodes; u++) {
-            float ulat = macro_nodes[u].lat;
-            float ulon = macro_nodes[u].lon;
-            bool u_excl_s = (excluded_start_bits[u >> 3] & (1U << (u & 7U))) != 0;
-            bool u_excl_e = (excluded_end_bits[u >> 3]   & (1U << (u & 7U))) != 0;
-
-            for (uint32_t e = macro_first_edge[u]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
-                if (e >= forward_edges_count) continue;
-                uint32_t v = macro_edges[e].target;
-                float vlat = macro_nodes[v].lat;
-                float vlon = macro_nodes[v].lon;
-                float w = macro_edges[e].weight;
-
-                if (!u_excl_s && !(excluded_start_bits[v >> 3] & (1U << (v & 7U)))) {
-                    float t_s, plat_s, plon_s;
-                    float d2_s = project_point_onto_segment_m2(
-                        start_lat, start_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_s, plat_s, plon_s
-                    );
-                    if (d2_s <= start_corridor_d2) {
-                        float perp_pen = max(0.0f, sqrtf(d2_s) - base_s_dist);
-                        float cost_to_v = perp_pen + (1.0f - t_s) * w;
-                        if (cost_to_v < g_score[v]) {
-                            g_score[v] = cost_to_v;
-                            came_from[v] = 0xFFFFFFFF;
-                            push_pq(v, cost_to_v + fast_h_goal(v));
-                        }
-                        float cost_to_u = perp_pen + t_s * w;
-                        if (cost_to_u < g_score[u]) {
-                            g_score[u] = cost_to_u;
-                            came_from[u] = 0xFFFFFFFF;
-                            push_pq(u, cost_to_u + fast_h_goal(u));
-                        }
-                    }
-                }
-
-                if (!u_excl_e && !(excluded_end_bits[v >> 3] & (1U << (v & 7U)))) {
-                    float t_e, plat_e, plon_e;
-                    float d2_e = project_point_onto_segment_m2(
-                        end_lat, end_lng, ulat, ulon, vlat, vlon, lat_scale_m, lon_scale_m, t_e, plat_e, plon_e
-                    );
-                    if (d2_e <= end_corridor_d2) {
-                        goal_bits[u >> 3] |= (uint8_t)(1U << (u & 7U));
-                        goal_bits[v >> 3] |= (uint8_t)(1U << (v & 7U));
-                    }
-                }
-            }
-            if ((u & 4095U) == 0) yield();
         }
 
-        goal_bits[best_end_u >> 3] |= (uint8_t)(1U << (best_end_u & 7U));
-        goal_bits[best_end_v >> 3] |= (uint8_t)(1U << (best_end_v & 7U));
+        for (uint32_t e = macro_first_edge[curr]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
+            uint16_t target = macro_edges[e].target;
+            if (closed_bits[target >> 3] & (1U << (target & 7U))) continue;
 
-        uint32_t loop_cnt = 0;
-        uint32_t visited_in_comp = 0;
-
-        while (pq_size > 0) {
-            uint32_t curr = pop_pq().id;
-            if (goal_bits[curr >> 3] & (1U << (curr & 7U))) {
-                final_end_node = curr;
-                reached = true;
-                break;
+            float tentative_g = curr_g + (float)macro_edges[e].weight_q * 0.25f;
+            if (tentative_g < g_score[target]) {
+                came_from[target] = (uint16_t)curr;
+                g_score[target] = tentative_g;
+                float h_val = fast_h_goal(target);
+                if (h_val < min_h_seen) min_h_seen = h_val;
+                push_pq(target, tentative_g + h_val);
             }
-
-            uint8_t mask = (uint8_t)(1U << (curr & 7U));
-            uint32_t byte_idx = curr >> 3;
-            if (closed_bits[byte_idx] & mask) continue;
-            closed_bits[byte_idx] |= mask;
-            visited_in_comp++;
-
-            float curr_g = g_score[curr];
-
-            for (uint32_t e = macro_first_edge[curr]; e != 0xFFFFFFFF; e = macro_edges[e].next) {
-                uint32_t target = macro_edges[e].target;
-                if (closed_bits[target >> 3] & (1U << (target & 7U))) continue;
-
-                float tentative_g = curr_g + macro_edges[e].weight;
-                if (tentative_g < g_score[target]) {
-                    came_from[target] = curr;
-                    g_score[target] = tentative_g;
-                    push_pq(target, tentative_g + fast_h_goal(target));
-                }
-            }
-            if ((++loop_cnt & 4095U) == 0) yield();
         }
 
-        if (reached) break;
+        if ((++loop_cnt & 2047U) == 0) {
+            float advance = 1.0f - (min_h_seen / max(1.0f, direct_dist_m));
+            if (advance < 0.05f) advance = 0.05f;
+            if (advance > 0.96f) advance = 0.96f;
+            uint8_t dyn_pct = search_base_pct + (uint8_t)(advance * (float)search_span_pct);
+            actualizar_progreso_ruta_ui(min((uint8_t)96, dyn_pct), "TRAZANDO RUTA OPTIMA");
+            yield();
+        }
+    }
 
-        uint32_t best_reached_end = 0xFFFFFFFF;
-        float best_reached_d2 = 1e30f;
+    // Respaldo de proximidad si la meta quedó a menos de 220m de un nodo visitado
+    if (!reached) {
+        float best_reached_d2 = 220.0f * 220.0f;
         for (uint32_t i = 0; i < total_nodes; i++) {
             if (closed_bits[i >> 3] & (1U << (i & 7U))) {
                 float dxe = (macro_nodes[i].lon - end_lng) * lon_scale_m;
@@ -3290,60 +3396,61 @@ static bool run_astar_multi_hwy_files(
                 float d2e = dxe * dxe + dye * dye;
                 if (d2e < best_reached_d2) {
                     best_reached_d2 = d2e;
-                    best_reached_end = i;
+                    final_end_node = (uint16_t)i;
+                    reached = true;
                 }
             }
         }
-
-        if (best_reached_end != 0xFFFFFFFF && best_reached_d2 <= (180.0f * 180.0f) && visited_in_comp >= 12) {
-            final_end_node = best_reached_end;
-            best_end_proj_lat = macro_nodes[best_reached_end].lat;
-            best_end_proj_lon = macro_nodes[best_reached_end].lon;
-            reached = true;
-            break;
-        }
-
-        if (visited_in_comp > 60) {
-            for (uint32_t b = 0; b < active_closed_bytes; b++) {
-                excluded_end_bits[b] |= goal_bits[b];
-            }
-            excluded_end_bits[best_end_u >> 3] |= (uint8_t)(1U << (best_end_u & 7U));
-            excluded_end_bits[best_end_v >> 3] |= (uint8_t)(1U << (best_end_v & 7U));
-        } else {
-            for (uint32_t b = 0; b < active_closed_bytes; b++) {
-                excluded_start_bits[b] |= closed_bits[b];
-            }
-            excluded_start_bits[best_start_u >> 3] |= (uint8_t)(1U << (best_start_u & 7U));
-            excluded_start_bits[best_start_v >> 3] |= (uint8_t)(1U << (best_start_v & 7U));
-        }
     }
 
-    if (!reached || final_end_node == 0xFFFFFFFF) return false;
+    if (!reached || final_end_node == INVALID_NODE_16) return false;
 
-    if (came_from[final_end_node] != 0xFFFFFFFF) {
-        uint32_t prev_n = came_from[final_end_node];
+    // Ajuste fino del segmento final e inicial reales de la cadena A*
+    float best_end_proj_lat = macro_nodes[final_end_node].lat;
+    float best_end_proj_lon = macro_nodes[final_end_node].lon;
+    if (came_from[final_end_node] != INVALID_NODE_16) {
+        uint16_t prev_n = came_from[final_end_node];
         float t_chk, plat_chk, plon_chk;
-        float d2_chk = project_point_onto_segment_m2(
+        project_point_onto_segment_m2(
             end_lat, end_lng,
             macro_nodes[prev_n].lat, macro_nodes[prev_n].lon,
             macro_nodes[final_end_node].lat, macro_nodes[final_end_node].lon,
             lat_scale_m, lon_scale_m,
             t_chk, plat_chk, plon_chk
         );
-        if (d2_chk <= end_corridor_d2 && t_chk < 0.85f) {
-            best_end_proj_lat = plat_chk;
-            best_end_proj_lon = plon_chk;
+        best_end_proj_lat = plat_chk;
+        best_end_proj_lon = plon_chk;
+        if (t_chk < 0.85f) {
             final_end_node = prev_n;
         }
     }
 
     uint32_t raw_count = 0;
-    uint32_t c = final_end_node;
-    while (c != 0xFFFFFFFF && raw_count < total_nodes) {
+    uint16_t c = final_end_node;
+    uint16_t first_route_node = final_end_node;
+    uint16_t second_route_node = final_end_node;
+    while (c != INVALID_NODE_16 && raw_count < total_nodes) {
+        second_route_node = first_route_node;
+        first_route_node = c;
         raw_count++;
         c = came_from[c];
     }
     if (raw_count == 0) return false;
+
+    float best_start_proj_lat = macro_nodes[first_route_node].lat;
+    float best_start_proj_lon = macro_nodes[first_route_node].lon;
+    if (second_route_node != first_route_node) {
+        float t_s, plat_s, plon_s;
+        project_point_onto_segment_m2(
+            start_lat, start_lng,
+            macro_nodes[first_route_node].lat, macro_nodes[first_route_node].lon,
+            macro_nodes[second_route_node].lat, macro_nodes[second_route_node].lon,
+            lat_scale_m, lon_scale_m,
+            t_s, plat_s, plon_s
+        );
+        best_start_proj_lat = plat_s;
+        best_start_proj_lon = plon_s;
+    }
 
     uint32_t max_graph_pts = MAX_ROUTE_POINTS_POOL - 4;
     uint32_t graph_pts = (raw_count > max_graph_pts) ? max_graph_pts : raw_count;
@@ -3365,11 +3472,11 @@ static bool run_astar_multi_hwy_files(
         for (uint32_t i = 0; i < max_graph_pts; i++) {
             uint32_t target_step = (i * raw_count) / max_graph_pts;
             uint32_t cur_step = (i == 0) ? 0 : (((i - 1) * raw_count) / max_graph_pts);
-            while (cur_step < target_step && c != 0xFFFFFFFF) {
+            while (cur_step < target_step && c != INVALID_NODE_16) {
                 c = came_from[c];
                 cur_step++;
             }
-            if (c == 0xFFFFFFFF) break;
+            if (c == INVALID_NODE_16) break;
             latlon_to_norm_mercator(
                 macro_nodes[c].lat,
                 macro_nodes[c].lon,
@@ -3431,16 +3538,22 @@ void calcular_y_dibujar_ruta() {
         lv_timer_handler(); 
         xSemaphoreGiveRecursive(lvgl_mutex);
     }
-    actualizar_progreso_ruta_ui(12, "BUSCANDO SECTORES");
+    actualizar_progreso_ruta_ui(10, "SELECCIONANDO SECTORES");
 
     liberar_buffers_ruta();
     bool reached = false; 
     last_astar_fail_reason = 0;
 
-    int32_t start_sx = (int32_t)((start_lng + 180.0) / 0.02);
-    int32_t start_sy = (int32_t)((start_lat + 90.0) / 0.02);
-    int32_t end_sx   = (int32_t)((target_route_lng + 180.0) / 0.02);
-    int32_t end_sy   = (int32_t)((target_route_lat + 90.0) / 0.02);
+    float s_lat = (float)start_lat;
+    float s_lng = (float)start_lng;
+    float e_lat = (float)target_route_lat;
+    float e_lng = (float)target_route_lng;
+    float direct_dist_m = fast_distance(s_lat, s_lng, e_lat, e_lng);
+
+    int32_t start_sx = (int32_t)floor((start_lng + 180.0) / 0.02);
+    int32_t start_sy = (int32_t)floor((start_lat + 90.0) / 0.02);
+    int32_t end_sx   = (int32_t)floor((target_route_lng + 180.0) / 0.02);
+    int32_t end_sy   = (int32_t)floor((target_route_lat + 90.0) / 0.02);
     int32_t mid_sx   = (start_sx + end_sx) / 2;
     int32_t mid_sy   = (start_sy + end_sy) / 2;
 
@@ -3449,35 +3562,32 @@ void calcular_y_dibujar_ruta() {
         int32_t sy;
         float prio;
     };
-    SectorCandidate cands[64];
-    int cand_count = 0;
 
-    int32_t min_sx = min(start_sx, end_sx) - 1;
-    int32_t max_sx = max(start_sx, end_sx) + 1;
-    int32_t min_sy = min(start_sy, end_sy) - 1;
-    int32_t max_sy = max(start_sy, end_sy) + 1;
+    auto build_sector_list = [&](float cap_rad_m, bool include_arterial, char (*out_files)[64]) -> int {
+        float pad_deg = (cap_rad_m / 111319.9f) * 1.15f;
+        int32_t min_sx = (int32_t)floor(((double)min(s_lng, e_lng) - pad_deg + 180.0) / 0.02);
+        int32_t max_sx = (int32_t)floor(((double)max(s_lng, e_lng) + pad_deg + 180.0) / 0.02);
+        int32_t min_sy = (int32_t)floor(((double)min(s_lat, e_lat) - pad_deg + 90.0)  / 0.02);
+        int32_t max_sy = (int32_t)floor(((double)max(s_lat, e_lat) + pad_deg + 90.0)  / 0.02);
 
-    // -----------------------------------------------------------------
-    // ETAPA 1 (15% -> 65%): CORREDOR MULTI-SECTOR COSIDO (RUTA MÁS CORTA)
-    // -----------------------------------------------------------------
-    if ((max_sx - min_sx) <= 14 && (max_sy - min_sy) <= 14) {
-        float ax = (float)start_sx, ay = (float)start_sy;
-        float bx = (float)end_sx,   by = (float)end_sy;
-        float vx = bx - ax,         vy = by - ay;
-        float seg_len2 = vx * vx + vy * vy;
+        if ((max_sx - min_sx) > 14 || (max_sy - min_sy) > 14) return 0;
+
+        SectorCandidate cands[64];
+        int cand_count = 0;
 
         for (int32_t sx = min_sx; sx <= max_sx; sx++) {
             for (int32_t sy = min_sy; sy <= max_sy; sy++) {
-                float wx = (float)sx - ax;
-                float wy = (float)sy - ay;
-                float t = (seg_len2 > 0.0f) ? ((wx * vx + wy * vy) / seg_len2) : 0.0f;
-                if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-                float dx = wx - t * vx;
-                float dy = wy - t * vy;
-                float d2_seg = dx * dx + dy * dy;
-
-                if (d2_seg <= 3.5f && cand_count < 64) {
-                    cands[cand_count++] = {sx, sy, d2_seg * 10.0f + t};
+                float sec_clon = ((float)sx + 0.5f) * 0.02f - 180.0f;
+                float sec_clat = ((float)sy + 0.5f) * 0.02f - 90.0f;
+                float t_sec, plat_sec, plon_sec;
+                float d2_m = project_point_onto_segment_m2(
+                    sec_clat, sec_clon, s_lat, s_lng, e_lat, e_lng, 111319.9f, 104000.0f, t_sec, plat_sec, plon_sec
+                );
+                float max_sec_reach = cap_rad_m + 1750.0f;
+                if (d2_m <= (max_sec_reach * max_sec_reach) && cand_count < 64) {
+                    bool is_endpoint = (sx == start_sx && sy == start_sy) || (sx == end_sx && sy == end_sy);
+                    float prio = is_endpoint ? (t_sec * 0.1f) : (1.0f + (d2_m * 1e-6f) + t_sec);
+                    cands[cand_count++] = {sx, sy, prio};
                 }
             }
         }
@@ -3492,66 +3602,72 @@ void calcular_y_dibujar_ruta() {
             }
         }
 
-        static char files_to_merge[24][64];
         int merge_count = 0;
-        for (int i = 0; i < cand_count && merge_count < 22; i++) {
-            snprintf(files_to_merge[merge_count], 64, "/SECTORS/S_%d_%d.HWY", (int)cands[i].sx, (int)cands[i].sy);
-            if (sd.exists(files_to_merge[merge_count])) {
+        for (int i = 0; i < cand_count && merge_count < 16; i++) {
+            snprintf(out_files[merge_count], 64, "/SECTORS/S_%d_%d.HWY", (int)cands[i].sx, (int)cands[i].sy);
+            if (sd.exists(out_files[merge_count])) {
                 merge_count++;
             }
         }
-        if (sd.exists("/ARTERIAL.HWY") && merge_count < 24) {
-            strncpy(files_to_merge[merge_count++], "/ARTERIAL.HWY", 64);
+        if (include_arterial && sd.exists("/ARTERIAL.HWY") && merge_count < 18) {
+            strncpy(out_files[merge_count++], "/ARTERIAL.HWY", 64);
         }
+        return merge_count;
+    };
 
+    static char files_to_merge[18][64];
+
+    // -----------------------------------------------------------------
+    // PASADA 1 (12% -> 95%): CÁPSULA DINÁMICA AJUSTADA (ULTRA-RÁPIDA)
+    // -----------------------------------------------------------------
+    float tight_radius_m = constrain(direct_dist_m * 0.42f + 320.0f, 420.0f, 2000.0f);
+    int merge_count = build_sector_list(tight_radius_m, (direct_dist_m > 7500.0f), files_to_merge);
+    if (merge_count > 0) {
+        reached = run_astar_multi_hwy_files(
+            files_to_merge,
+            merge_count,
+            s_lat, s_lng,
+            e_lat, e_lng,
+            4500.0f,
+            true,
+            tight_radius_m,
+            12, 82
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // PASADA 2 (RESPALDO AMPLIO + ARTERIAL SI HAY RODEOS GEOGRÁFICOS)
+    // -----------------------------------------------------------------
+    if (!reached) {
+        float wide_radius_m = constrain(direct_dist_m * 0.85f + 1400.0f, 1800.0f, 4500.0f);
+        merge_count = build_sector_list(wide_radius_m, true, files_to_merge);
         if (merge_count > 0) {
             reached = run_astar_multi_hwy_files(
                 files_to_merge,
                 merge_count,
-                (float)start_lat, (float)start_lng,
-                (float)target_route_lat, (float)target_route_lng,
-                4500.0f,
+                s_lat, s_lng,
+                e_lat, e_lng,
+                6000.0f,
                 true,
-                15, 50
+                wide_radius_m,
+                55, 38
             );
         }
     }
 
     // -----------------------------------------------------------------
-    // ETAPA 2 (65% -> 80%): SECTOR INDIVIDUAL SIN FILTRO DE CÁPSULA
-    // -----------------------------------------------------------------
-    if (!reached && abs(start_sx - end_sx) <= 2 && abs(start_sy - end_sy) <= 2) {
-        int32_t single_sx[3] = { mid_sx, start_sx, end_sx };
-        int32_t single_sy[3] = { mid_sy, start_sy, end_sy };
-        static char single_file[1][64];
-
-        for (int c = 0; c < 3 && !reached; c++) {
-            snprintf(single_file[0], 64, "/SECTORS/S_%d_%d.HWY", (int)single_sx[c], (int)single_sy[c]);
-            if (sd.exists(single_file[0])) {
-                reached = run_astar_multi_hwy_files(
-                    single_file, 1,
-                    (float)start_lat, (float)start_lng,
-                    (float)target_route_lat, (float)target_route_lng,
-                    5000.0f,
-                    false,
-                    65, 15
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // ETAPA 3 (80% -> 96%): RESPALDO GARANTIZADO EN /ARTERIAL.HWY PURO
+    // PASADA 3 (RUTEO ESTATAL DE LARGA DISTANCIA EN /ARTERIAL.HWY)
     // -----------------------------------------------------------------
     if (!reached && sd.exists("/ARTERIAL.HWY")) {
         static char art_only[1][64] = { "/ARTERIAL.HWY" };
         reached = run_astar_multi_hwy_files(
             art_only, 1,
-            (float)start_lat, (float)start_lng,
-            (float)target_route_lat, (float)target_route_lng,
+            s_lat, s_lng,
+            e_lat, e_lng,
             55000.0f,
             false,
-            80, 16
+            0.0f,
+            75, 22
         );
     }
 
