@@ -2764,6 +2764,12 @@ static lv_obj_t * bar_route_prog = NULL;
 static void actualizar_progreso_ruta_ui(uint8_t pct, const char* etapa_txt) {
     if (scr_mapa == NULL) return;
     if (pct > 100) pct = 100;
+    
+    // Rate-limiter estricto para no saturar LVGL y acelerar el cálculo ~3x
+    static uint32_t last_ui_update_ms = 0;
+    if (pct < 100 && millis() - last_ui_update_ms < 120) return; 
+    last_ui_update_ms = millis();
+
     if (xSemaphoreTakeRecursive(lvgl_mutex, pdMS_TO_TICKS(60))) {
         uint32_t col = get_active_tactical_color();
         if (panel_route_prog == NULL) {
@@ -3564,51 +3570,27 @@ void calcular_y_dibujar_ruta() {
     };
 
     auto build_sector_list = [&](float cap_rad_m, bool include_arterial, char (*out_files)[64]) -> int {
-        float pad_deg = (cap_rad_m / 111319.9f) * 1.15f;
+        float pad_deg = (cap_rad_m / 111319.9f) * 1.05f; 
         int32_t min_sx = (int32_t)floor(((double)min(s_lng, e_lng) - pad_deg + 180.0) / 0.02);
         int32_t max_sx = (int32_t)floor(((double)max(s_lng, e_lng) + pad_deg + 180.0) / 0.02);
         int32_t min_sy = (int32_t)floor(((double)min(s_lat, e_lat) - pad_deg + 90.0)  / 0.02);
         int32_t max_sy = (int32_t)floor(((double)max(s_lat, e_lat) + pad_deg + 90.0)  / 0.02);
-
-        if ((max_sx - min_sx) > 14 || (max_sy - min_sy) > 14) return 0;
 
         SectorCandidate cands[64];
         int cand_count = 0;
 
         for (int32_t sx = min_sx; sx <= max_sx; sx++) {
             for (int32_t sy = min_sy; sy <= max_sy; sy++) {
-                float sec_clon = ((float)sx + 0.5f) * 0.02f - 180.0f;
-                float sec_clat = ((float)sy + 0.5f) * 0.02f - 90.0f;
-                float t_sec, plat_sec, plon_sec;
-                float d2_m = project_point_onto_segment_m2(
-                    sec_clat, sec_clon, s_lat, s_lng, e_lat, e_lng, 111319.9f, 104000.0f, t_sec, plat_sec, plon_sec
-                );
-                float max_sec_reach = cap_rad_m + 1750.0f;
-                if (d2_m <= (max_sec_reach * max_sec_reach) && cand_count < 64) {
-                    bool is_endpoint = (sx == start_sx && sy == start_sy) || (sx == end_sx && sy == end_sy);
-                    float prio = is_endpoint ? (t_sec * 0.1f) : (1.0f + (d2_m * 1e-6f) + t_sec);
-                    cands[cand_count++] = {sx, sy, prio};
+                if (cand_count < 64) {
+                    snprintf(out_files[cand_count], 64, "/SECTORS/S_%d_%d.HWY", (int)sx, (int)sy);
+                    if (sd.exists(out_files[cand_count])) {
+                        cand_count++;
+                    }
                 }
             }
         }
 
-        for (int i = 0; i < cand_count - 1; i++) {
-            for (int j = i + 1; j < cand_count; j++) {
-                if (cands[j].prio < cands[i].prio) {
-                    SectorCandidate tmp = cands[i];
-                    cands[i] = cands[j];
-                    cands[j] = tmp;
-                }
-            }
-        }
-
-        int merge_count = 0;
-        for (int i = 0; i < cand_count && merge_count < 16; i++) {
-            snprintf(out_files[merge_count], 64, "/SECTORS/S_%d_%d.HWY", (int)cands[i].sx, (int)cands[i].sy);
-            if (sd.exists(out_files[merge_count])) {
-                merge_count++;
-            }
-        }
+        int merge_count = (cand_count < 16) ? cand_count : 16;
         if (include_arterial && sd.exists("/ARTERIAL.HWY") && merge_count < 18) {
             strncpy(out_files[merge_count++], "/ARTERIAL.HWY", 64);
         }
@@ -3620,7 +3602,7 @@ void calcular_y_dibujar_ruta() {
     // -----------------------------------------------------------------
     // PASADA 1 (12% -> 95%): CÁPSULA DINÁMICA AJUSTADA (ULTRA-RÁPIDA)
     // -----------------------------------------------------------------
-    float tight_radius_m = constrain(direct_dist_m * 0.42f + 320.0f, 420.0f, 2000.0f);
+    float tight_radius_m = constrain(direct_dist_m * 0.58f + 650.0f, 750.0f, 2800.0f);
     int merge_count = build_sector_list(tight_radius_m, (direct_dist_m > 7500.0f), files_to_merge);
     if (merge_count > 0) {
         reached = run_astar_multi_hwy_files(
@@ -3639,7 +3621,7 @@ void calcular_y_dibujar_ruta() {
     // PASADA 2 (RESPALDO AMPLIO + ARTERIAL SI HAY RODEOS GEOGRÁFICOS)
     // -----------------------------------------------------------------
     if (!reached) {
-        float wide_radius_m = constrain(direct_dist_m * 0.85f + 1400.0f, 1800.0f, 4500.0f);
+        float wide_radius_m = constrain(direct_dist_m * 1.15f + 2500.0f, 2500.0f, 6000.0f);
         merge_count = build_sector_list(wide_radius_m, true, files_to_merge);
         if (merge_count > 0) {
             reached = run_astar_multi_hwy_files(

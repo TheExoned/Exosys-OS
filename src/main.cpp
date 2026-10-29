@@ -32,6 +32,7 @@ extern volatile uint8_t ttw_mode;
 
 // PROPIEDAD ABSOLUTA DEL HARDWARE
 SemaphoreHandle_t lvgl_mutex = NULL;
+SemaphoreHandle_t i2c_mutex = NULL; // <--- AGREGA ESTA LÍNEA
 SdFs sd;
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
@@ -473,9 +474,10 @@ void setup() {
     // -----------------------------------------------------------------
     beginLvglHelper(instance);
     lvgl_mutex = xSemaphoreCreateRecursiveMutex();
+    i2c_mutex = xSemaphoreCreateMutex(); // <--- AGREGA ESTA LÍNEA
 
     init_pmu(); 
-    init_time_engine(); 
+    init_time_engine();
     init_kin_engine(); 
 
     if (!sd.begin(21, SD_SCK_MHZ(40))) Serial.println("[!] SD Fallo en Overclock a 40MHz.");

@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <LilyGoLib.h>
+extern SemaphoreHandle_t i2c_mutex;
 
 extern LilyGoUltra& instance;
 
@@ -51,6 +52,8 @@ void time_loop_handler() {
     static uint32_t last_time_read = 0;
     
     if (millis() - last_time_read > 1000) {
+        if (i2c_mutex != NULL) xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+
         if (gps_locked && gps.time.isValid() && gps.time.age() < 2000) {
             time_is_gnss = true;
             
@@ -100,10 +103,11 @@ void time_loop_handler() {
                 sys_hour = bcd_to_dec(Wire.read() & 0x3F);
             }
         }
-        
+
+        if (i2c_mutex != NULL) xSemaphoreGive(i2c_mutex);
         last_time_read = millis();
     }
-
+    
     static uint8_t last_eval_min = 60;
     if (sys_min != last_eval_min) {
         last_eval_min = sys_min; 
